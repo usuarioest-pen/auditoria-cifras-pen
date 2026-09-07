@@ -8,8 +8,8 @@ Los documentos auditados se procesan localmente y no se envían al sitio publica
 
 ## Uso
 
-- [Manifiesto público](https://programa-estado-nacion.github.io/auditoria-cifras-pen/manifest.xml)
-- [Interfaz publicada](https://programa-estado-nacion.github.io/auditoria-cifras-pen/)
+- [Manifiesto público](https://usuarioest-pen.github.io/autoria-cifras-pen/manifest.xml)
+- [Interfaz publicada](https://usuarioest-pen.github.io/auditoria-cifras-pen/)
 - Requisito: Microsoft Word con WordApi 1.4
 
 GitHub Pages publica automáticamente la interfaz y el manifiesto con cada cambio en
