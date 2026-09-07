@@ -8,7 +8,7 @@ Los documentos auditados se procesan localmente y no se envían al sitio publica
 
 ## Uso
 
-- [Manifiesto público](https://usuarioest-pen.github.io/autoria-cifras-pen/manifest.xml)
+- [Manifiesto público](https://usuarioest-pen.github.io/auditoria-cifras-pen/manifest.xml)
 - [Interfaz publicada](https://usuarioest-pen.github.io/auditoria-cifras-pen/)
 - Requisito: Microsoft Word con WordApi 1.4
 
