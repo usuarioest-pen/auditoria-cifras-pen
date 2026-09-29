@@ -300,6 +300,14 @@
     /* LISTA REGISTROS */
     #lista { display: flex; flex-direction: column; gap: 8px; }
     .tarjeta { background: #fff; border: 1px solid #D9D4C8; border-radius: 9px; overflow: hidden; }
+    /* Tarjeta cuya cifra tiene el cursor de Word encima en este momento (ver
+       "UBICACIÓN AUTOMÁTICA DEL CURSOR EN WORD"). */
+    .tarjeta-en-cursor { border: 2px solid #234E90; box-shadow: 0 0 0 3px rgba(35,78,144,.18); }
+    .tarjeta-en-cursor::before {
+      content: '📍 El cursor está en esta cifra dentro del documento';
+      display: block; background: #234E90; color: #fff; font-size: 12px; font-weight: 600;
+      padding: 5px 12px; letter-spacing: .2px;
+    }
     .tarjeta-cab { display: grid; grid-template-columns: 8px 1fr auto auto 32px; align-items: center; gap: 12px; padding: 11px 16px; cursor: pointer; user-select: none; }
     .tarjeta-cab:hover { background: #F9F8F6; }
     .sb { border-radius: 4px; align-self: stretch; min-height: 38px; width: 8px; }
@@ -493,7 +501,7 @@
 
     <div class="card">
       <h2>Marcar números en letras y en números</h2>
-      <p class="desc">Detecta, en el documento de Word activo, todas las cifras escritas con dígitos (por ejemplo 40,7% o 4.200) y todas las cifras escritas con letras (por ejemplo veintitrés millones o cuarenta y siete), usando el mismo analizador del Manual PEN que ya usa la búsqueda de "③ Revisar cifras". Cada aparición se resalta en amarillo dentro del documento y se agrega a la lista de abajo para asignarle un resultado, una fuente y, si aplica, la página, el link y un comentario.</p>
+      <p class="desc">Detecta, en el documento de Word activo, todas las cifras escritas con dígitos (por ejemplo 40,7% o 4.200) y todas las cifras escritas con letras (por ejemplo veintitrés millones o cuarenta y siete), usando el mismo analizador del Manual PEN que ya usa la búsqueda de "③ Revisar cifras". Cada aparición se resalta en amarillo dentro del documento y se agrega a la lista de abajo para asignarle un resultado, una fuente y, si aplica, la página, el link y un comentario. Mientras esta pestaña esté abierta, al colocar el cursor sobre una cifra ya marcada dentro del documento, la lista se desplaza y resalta automáticamente la tarjeta correspondiente.</p>
       <div style="display:flex;gap:10px;flex-wrap:wrap;">
         <button class="btn-p" id="btn-detectar" onclick="detectarYMarcarNumeros()">🟡 Detectar y marcar números en el documento</button>
         <button class="btn-s" onclick="quitarMarcadoAmarillo()">🧹 Quitar el resaltado amarillo del documento</button>
@@ -923,6 +931,13 @@ let deteccionEnCurso = false;
 // hallazgo ya se haya registrado y salga de `hallazgosDetectados`, para que
 // "Quitar el resaltado amarillo" pueda deshacer todo el marcado al final).
 let terminosMarcadosAmarillo = (() => { const v = leerJSONLocal('en_terminos_marcados', []); return Array.isArray(v) ? v.filter(x => typeof x === 'string' && x) : []; })();
+// Id del hallazgo cuya tarjeta está resaltada en pantalla porque el cursor de
+// Word está posicionado sobre esa cifra en el documento (ver "UBICACIÓN
+// AUTOMÁTICA DEL CURSOR EN WORD" más abajo). No se guarda en localStorage: es
+// solo un estado visual de la sesión actual.
+let hallazgoEnCursorId = null;
+let _ubicandoCursorEnCurso = false;
+let _selChangeWordTimer = null;
 
 // ── ESTADO DE REVISIÓN PERSISTENTE (v17) ────────────────────────────────────
 // Recuerda qué fuentes y qué coincidencias ya fueron inspeccionadas por la
@@ -1092,7 +1107,7 @@ function irA(v) {
     t.classList.toggle('activo', ['marcar','fuentes','revision'][i]===v)
   );
   if (v==='revision') { renderLista(); }
-  if (v==='marcar')   { renderHallazgos(); actualizarResumenDocumento(); }
+  if (v==='marcar')   { renderHallazgos(); actualizarResumenDocumento(); ubicarHallazgoBajoCursor(); }
 }
 
 // ── PANEL DE FUENTES (componente reutilizable) ───────────────────────────────
@@ -3001,17 +3016,20 @@ function seleccionarCoincidencia(ri, hi) {
 // si se tecleó distinto a como está escrito ahí), no se agrega el
 // comentario, pero la marca de "revisada" en el panel y en el documento
 // (guardarEnWordSettings) queda igual: esto nunca interrumpe la revisión.
-async function insertarComentarioWordSiCorresponde(textoCifra, mensaje) {
+async function insertarComentarioWordSiCorresponde(textoCifra, mensaje, contexto) {
   if (typeof Word === 'undefined' || !_hayWordSettings()) return;
   const texto = String(textoCifra || '').trim();
   if (!texto) return;
   try {
     await Word.run(async (context) => {
-      const resultados = context.document.body.search(texto, { matchCase: false, matchWholeWord: false });
-      resultados.load('items');
-      await context.sync();
-      if (resultados.items.length > 0) {
-        resultados.items[0].insertComment(mensaje);
+      // Antes se comentaba siempre la PRIMERA aparición del término en todo
+      // el documento (resultados.items[0]), sin importar si esa era en
+      // realidad la que se estaba auditando. Se usa la misma desambiguación
+      // por contexto que el resaltado de color (ubicarRangoDeCifraEnWord),
+      // definida más abajo, para comentar la aparición correcta.
+      const rango = await ubicarRangoDeCifraEnWord(context, texto, contexto, { matchCase: false, matchWholeWord: false });
+      if (rango) {
+        rango.insertComment(mensaje);
         await context.sync();
       }
     });
@@ -3432,11 +3450,12 @@ async function registrar() {
   // es la forma en que aparece en el documento activo que se está auditando
   // (la fuente puede tenerla escrita de otra forma equivalente, pero eso no
   // es lo que hay que resaltar aquí).
-  await actualizarColorEnWord(cifra, semRegistrado);
+  await actualizarColorEnWord(cifra, semRegistrado, ctx);
 
   const SEM_TXT = {verde:'Verificada', amarillo:'En revisión', rojo:'Con problema'};
   insertarComentarioWordSiCorresponde(cifra,
-    `Cifra "${cifra}" registrada en Auditoría de Cifras PEN — resultado: ${SEM_TXT[semRegistrado] || semRegistrado}. Fuente: ${fuenteRegistrada}. ${new Date().toLocaleDateString('es-CR')}.`);
+    `Cifra "${cifra}" registrada en Auditoría de Cifras PEN — resultado: ${SEM_TXT[semRegistrado] || semRegistrado}. Fuente: ${fuenteRegistrada}. ${new Date().toLocaleDateString('es-CR')}.`,
+    ctx);
 
   document.getElementById('inp-cifra').focus();
   window.scrollTo({top:0, behavior:'smooth'});
@@ -4206,6 +4225,54 @@ function actualizarUIDeteccion() {
   if (estado) estado.style.display = deteccionEnCurso ? 'block' : 'none';
 }
 
+// Arma la lista combinada y ordenada de candidatos a "cifra" dentro de un
+// texto cualquiera: proporciones explícitas, cifras con unidad de medida,
+// cifras en dígitos y cifras en letras, sin duplicar lo que ya quedó
+// cubierto por un candidato más específico. La usa "Detectar y marcar
+// números" sobre el documento completo, y también "ubicarHallazgoBajoCursor"
+// sobre un solo párrafo, para saber exactamente qué cifra hay bajo el cursor.
+function detectarCandidatosEnTexto(texto) {
+  // 1) Proporciones explícitas ("1 de cada 5", "uno de cada cinco", "3 por
+  //    cada 10", "2 entre 7", "1/5"): se detectan primero y se tratan como
+  //    UNA sola cifra, no como dos números sueltos.
+  const proporciones = extraerCandidatosProporcion(texto);
+  const seSuperponeCon = (p, lista) => lista.some(d => p.indice < (d.indice + d.largo) && (p.indice + p.largo) > d.indice);
+
+  // 2) Cifras (en dígitos o en letras) seguidas de una unidad de medida
+  //    ("42,5 km", "cinco hectáreas", "36°C", "3 mil habitantes por km²"):
+  //    se marcan como UN solo hallazgo que incluye la unidad, no solo el
+  //    número, para que la unidad quede resaltada junto con la cifra.
+  const unidades = extraerCandidatosUnidad(texto).filter(u => !seSuperponeCon(u, proporciones));
+
+  // 3) Candidatos en dígitos (40,7% · 4.200 · 2024) y en letras (veintitrés
+  //    millones · cuarenta y siete · una decena · un centenar · cientos),
+  //    con el mismo criterio que ya usa la búsqueda manual de cifras. Se
+  //    excluye lo que ya quedó cubierto por una proporción o por una cifra
+  //    con unidad, para no partirla en varios hallazgos.
+  const digitos = candidatosNumericosTexto(texto)
+    .filter(d => !seSuperponeCon(d, proporciones))
+    .filter(d => !seSuperponeCon(d, unidades));
+  const palabras = extraerCandidatosNumeroPalabras(texto)
+    // "un/una/uno" sueltos son casi siempre el artículo, no una cifra —
+    // marcarlos resaltaría casi cualquier frase del documento.
+    .filter(p => !/^(?:un|una|uno)$/i.test(p.termino.trim()))
+    .filter(p => !seSuperponeCon(p, proporciones))
+    .filter(p => !seSuperponeCon(p, unidades));
+
+  // 4) Si una cifra en letras se solapa (total o parcialmente) con una cifra
+  //    en dígitos ya detectada —p. ej. el "millones de colones" de
+  //    "4.200 millones de colones", que ya viene incluido en el candidato
+  //    en dígitos— no se duplica como hallazgo aparte.
+  const palabrasFiltradas = palabras.filter(p => !seSuperponeCon(p, digitos));
+
+  return [
+    ...proporciones.map(x => ({ ...x, tipoDeteccion: 'proporcion' })),
+    ...unidades.map(u => ({ ...u, tipoDeteccion: 'unidad' })),
+    ...digitos.map(d => ({ ...d, tipoDeteccion: 'digitos' })),
+    ...palabrasFiltradas.map(p => ({ ...p, tipoDeteccion: 'palabras' }))
+  ].sort((a, b) => a.indice - b.indice);
+}
+
 async function detectarYMarcarNumeros() {
   if (typeof Word === 'undefined') {
     avisar('Esta función solo está disponible cuando la herramienta se ejecuta como complemento dentro de Word, con el documento abierto.');
@@ -4223,45 +4290,10 @@ async function detectarYMarcarNumeros() {
     });
     if (!texto.trim()) { await avisar('No se encontró texto en el documento activo.'); return; }
 
-    // 1) Proporciones explícitas ("1 de cada 5", "uno de cada cinco", "3 por
-    //    cada 10", "2 entre 7", "1/5"): se detectan primero y se tratan como
-    //    UNA sola cifra, no como dos números sueltos.
-    const proporciones = extraerCandidatosProporcion(texto);
-    const seSuperponeCon = (p, lista) => lista.some(d => p.indice < (d.indice + d.largo) && (p.indice + p.largo) > d.indice);
-
-    // 2) Cifras (en dígitos o en letras) seguidas de una unidad de medida
-    //    ("42,5 km", "cinco hectáreas", "36°C", "3 mil habitantes por km²"):
-    //    se marcan como UN solo hallazgo que incluye la unidad, no solo el
-    //    número, para que la unidad quede resaltada junto con la cifra.
-    const unidades = extraerCandidatosUnidad(texto).filter(u => !seSuperponeCon(u, proporciones));
-
-    // 3) Candidatos en dígitos (40,7% · 4.200 · 2024) y en letras (veintitrés
-    //    millones · cuarenta y siete · una decena · un centenar · cientos),
-    //    con el mismo criterio que ya usa la búsqueda manual de cifras. Se
-    //    excluye lo que ya quedó cubierto por una proporción o por una cifra
-    //    con unidad, para no partirla en varios hallazgos.
-    const digitos = candidatosNumericosTexto(texto)
-      .filter(d => !seSuperponeCon(d, proporciones))
-      .filter(d => !seSuperponeCon(d, unidades));
-    const palabras = extraerCandidatosNumeroPalabras(texto)
-      // "un/una/uno" sueltos son casi siempre el artículo, no una cifra —
-      // marcarlos resaltaría casi cualquier frase del documento.
-      .filter(p => !/^(?:un|una|uno)$/i.test(p.termino.trim()))
-      .filter(p => !seSuperponeCon(p, proporciones))
-      .filter(p => !seSuperponeCon(p, unidades));
-
-    // 4) Si una cifra en letras se solapa (total o parcialmente) con una cifra
-    //    en dígitos ya detectada —p. ej. el "millones de colones" de
-    //    "4.200 millones de colones", que ya viene incluido en el candidato
-    //    en dígitos— no se duplica como hallazgo aparte.
-    const palabrasFiltradas = palabras.filter(p => !seSuperponeCon(p, digitos));
-
-    const combinados = [
-      ...proporciones.map(x => ({ ...x, tipoDeteccion: 'proporcion' })),
-      ...unidades.map(u => ({ ...u, tipoDeteccion: 'unidad' })),
-      ...digitos.map(d => ({ ...d, tipoDeteccion: 'digitos' })),
-      ...palabrasFiltradas.map(p => ({ ...p, tipoDeteccion: 'palabras' }))
-    ].sort((a, b) => a.indice - b.indice);
+    // Candidatos en dígitos, en letras, con unidad de medida y proporciones
+    // (ver detectarCandidatosEnTexto). Se reutiliza también, sobre un solo
+    // párrafo, para "ubicar" en esta lista la cifra donde está el cursor.
+    const combinados = detectarCandidatosEnTexto(texto);
 
     if (combinados.length === 0) {
       await avisar('No se detectaron números, ni en dígitos ni en letras, en el documento activo.');
@@ -4341,20 +4373,62 @@ async function marcarTerminosEnAmarillo(terminos) {
   }
 }
 
-// Cambia, en el documento, el color de resaltado de una cifra ya marcada
+// Busca, DENTRO del `context` de Word.run ya abierto, el Range que
+// corresponde a esta aparición concreta de una cifra — no a cualquier otra
+// aparición del mismo texto en el resto del documento. Si el término aparece
+// una sola vez no hay ambigüedad. Si aparece varias veces (cifras cortas como
+// "4", "10" o años como "2024" se repiten con frecuencia en cualquier
+// informe), se desempata comparando el contexto guardado de este hallazgo o
+// registro contra el texto real alrededor de cada aparición (el párrafo que
+// la contiene y la posición exacta dentro de él), para no aplicar el cambio
+// a una aparición distinta de la que en realidad se está auditando.
+async function ubicarRangoDeCifraEnWord(context, termino, contexto, opciones) {
+  const resultados = context.document.body.search(termino, opciones || opcionesBusquedaWord(termino));
+  resultados.load('items');
+  await context.sync();
+  const items = resultados.items;
+  if (items.length === 0) return null;
+  if (items.length === 1 || !contexto) return items[0];
+
+  const infos = items.map(item => {
+    const parrafo = item.paragraphs.getFirstOrNullObject();
+    parrafo.load('text');
+    const inicioHastaMarca = parrafo.getRange('Start').expandTo(item.getRange('Start'));
+    inicioHastaMarca.load('text');
+    return { item, parrafo, inicioHastaMarca };
+  });
+  await context.sync();
+
+  let mejor = items[0], mejorPuntaje = -1;
+  infos.forEach(({ item, parrafo, inicioHastaMarca }) => {
+    if (parrafo.isNullObject) return;
+    const texto = parrafo.text || '';
+    const offset = (inicioHastaMarca.text || '').length;
+    const desde = Math.max(0, offset - 70);
+    const hasta = Math.min(texto.length, offset + termino.length + 70);
+    const ventana = texto.slice(desde, hasta);
+    const puntaje = puntajeCoincidenciaContexto(ventana, contexto);
+    if (puntaje > mejorPuntaje) { mejorPuntaje = puntaje; mejor = item; }
+  });
+  return mejor;
+}
+
+// Cambia, en el documento, el color de resaltado de UNA cifra ya marcada
 // según el resultado del semáforo elegido al registrarla: verde = Verificado,
-// amarillo = Corregir/en revisión, rojo = Con problema.
-async function actualizarColorEnWord(termino, semaforo) {
+// amarillo = Corregir/en revisión, rojo = Con problema. Solo esa aparición
+// puntual (identificada por su termino + contexto), nunca todas las
+// apariciones del mismo texto en el resto del documento — ver
+// ubicarRangoDeCifraEnWord.
+async function actualizarColorEnWord(termino, semaforo, contexto) {
   if (typeof Word === 'undefined' || !termino) return;
   const COLOR = { verde: 'green', amarillo: 'yellow', rojo: 'red' };
   const color = COLOR[semaforo];
   if (!color) return;
   try {
     await Word.run(async (context) => {
-      const resultados = context.document.body.search(termino, opcionesBusquedaWord(termino));
-      resultados.load('items');
-      await context.sync();
-      resultados.items.forEach(item => { item.font.highlightColor = color; });
+      const rango = await ubicarRangoDeCifraEnWord(context, termino, contexto);
+      if (!rango) return;
+      rango.font.highlightColor = color;
       await context.sync();
     });
   } catch (e) {
@@ -4426,6 +4500,129 @@ async function descartarHallazgo(id) {
   actualizarResumenDocumento();
 }
 
+// ── UBICACIÓN AUTOMÁTICA DEL CURSOR EN WORD ─────────────────────────────────
+// Cuando la persona auditora coloca el cursor sobre una cifra ya detectada en
+// "① Marcar números" dentro del propio documento de Word, esta sección
+// resalta y desplaza la lista de abajo hasta la tarjeta correspondiente, para
+// que sepa de inmediato qué está auditando sin tener que buscarla a mano
+// entre cientos o miles de hallazgos. Es el equivalente, en el complemento,
+// de hacer clic sobre una cifra marcada en la pestaña "① Documento auditado"
+// de la versión HTML (auditoria_EN_v19_addin.html).
+function registrarDetectorDeCursorEnWord() {
+  if (typeof Office === 'undefined' || !Office.context || !Office.context.document || typeof Office.context.document.addHandlerAsync !== 'function') return;
+  if (typeof Word === 'undefined') return; // esta función necesita WordApi (rangos y párrafos)
+  try {
+    Office.context.document.addHandlerAsync(Office.EventType.DocumentSelectionChanged, () => {
+      clearTimeout(_selChangeWordTimer);
+      _selChangeWordTimer = setTimeout(ubicarHallazgoBajoCursor, 250);
+    });
+  } catch (e) {
+    console.warn('No se pudo activar la ubicación automática del cursor en el documento.', e);
+  }
+}
+
+// Determina el párrafo donde está el cursor y la posición del cursor dentro
+// de ese párrafo, busca ahí la cifra bajo el cursor con el mismo analizador
+// que usa "Detectar y marcar números", y resalta en la lista la tarjeta del
+// hallazgo que le corresponde.
+async function ubicarHallazgoBajoCursor() {
+  const vistaMarcar = document.getElementById('vista-marcar');
+  if (!vistaMarcar || vistaMarcar.style.display === 'none') return; // solo tiene sentido en "① Marcar números"
+  if (typeof Word === 'undefined' || hallazgosDetectados.length === 0) return;
+  if (_ubicandoCursorEnCurso) return;
+  _ubicandoCursorEnCurso = true;
+  try {
+    let parrafoTexto = null, offset = -1;
+    await Word.run(async (context) => {
+      const seleccion = context.document.getSelection();
+      const parrafo = seleccion.paragraphs.getFirstOrNullObject();
+      parrafo.load('text');
+      const inicioHastaCursor = parrafo.getRange('Start').expandTo(seleccion.getRange('Start'));
+      inicioHastaCursor.load('text');
+      await context.sync();
+      if (parrafo.isNullObject) return;
+      parrafoTexto = parrafo.text || '';
+      offset = (inicioHastaCursor.text || '').length;
+    });
+    if (parrafoTexto === null || offset < 0) { marcarUbicacionActual(null); return; }
+
+    const candidato = detectarCandidatosEnTexto(parrafoTexto)
+      .find(c => offset >= c.indice && offset <= c.indice + c.largo);
+    if (!candidato) { marcarUbicacionActual(null); return; }
+
+    const termino = candidato.termino.trim();
+    const opciones = hallazgosDetectados.filter(h => h.termino === termino);
+    if (opciones.length === 0) { marcarUbicacionActual(null); return; }
+
+    // Si varias tarjetas comparten exactamente la misma cifra (p. ej. "2024"
+    // repetido varias veces en el documento), se desempata comparando el
+    // contexto guardado de cada una contra el texto real del párrafo donde
+    // está ahora el cursor, para escoger la que de verdad corresponde a este
+    // punto del documento.
+    let elegido = opciones[0];
+    if (opciones.length > 1) {
+      let mejorPuntaje = -1;
+      opciones.forEach(h => {
+        const puntaje = puntajeCoincidenciaContexto(parrafoTexto, h.contexto);
+        if (puntaje > mejorPuntaje) { mejorPuntaje = puntaje; elegido = h; }
+      });
+    }
+    marcarUbicacionActual(elegido.id);
+  } catch (e) {
+    console.warn('No se pudo ubicar la cifra bajo el cursor.', e);
+  } finally {
+    _ubicandoCursorEnCurso = false;
+  }
+}
+
+// Puntaje de qué tan bien coincide el contexto guardado de un hallazgo con el
+// texto real de un párrafo del documento: 2 si el contexto completo aparece
+// dentro del párrafo, 1 si al menos su núcleo (los caracteres centrales, que
+// no dependen de dónde se cortó el contexto con "…") aparece, 0 si no.
+function puntajeCoincidenciaContexto(parrafoTexto, contexto) {
+  const limpio = String(contexto || '').replace(/^…/, '').replace(/…$/, '').trim();
+  if (!limpio) return 0;
+  if (parrafoTexto.includes(limpio)) return 2;
+  const mitad = Math.floor(limpio.length / 2);
+  const nucleo = limpio.slice(Math.max(0, mitad - 20), mitad + 20);
+  return nucleo.length >= 8 && parrafoTexto.includes(nucleo) ? 1 : 0;
+}
+
+// Resalta, expande y desplaza hasta la tarjeta del hallazgo indicado (o
+// quita el resaltado si se pasa null porque el cursor ya no está sobre
+// ninguna cifra marcada). Si el filtro o la búsqueda de la lista la tienen
+// oculta, los limpia primero para que la tarjeta pueda mostrarse.
+function marcarUbicacionActual(id) {
+  if (id === hallazgoEnCursorId) return;
+  const anteriorId = hallazgoEnCursorId;
+  hallazgoEnCursorId = id;
+  if (anteriorId) {
+    const elAnterior = document.getElementById('hz-tarjeta-' + anteriorId);
+    if (elAnterior) elAnterior.classList.remove('tarjeta-en-cursor');
+  }
+  if (!id) return;
+
+  let el = document.getElementById('hz-tarjeta-' + id);
+  if (!el) {
+    const busq = document.getElementById('hz-buscar');
+    const filtro = document.getElementById('hz-filtro-estado');
+    let cambio = false;
+    if (busq && busq.value) { busq.value = ''; cambio = true; }
+    if (filtro && filtro.value !== 'todas') { filtro.value = 'todas'; cambio = true; }
+    if (cambio) { renderHallazgos(); el = document.getElementById('hz-tarjeta-' + id); }
+  }
+  if (!el) return;
+
+  if (expandidoHallazgo !== id) {
+    expandidoHallazgo = id;
+    renderHallazgos();
+    el = document.getElementById('hz-tarjeta-' + id);
+    if (!el) return;
+  }
+  el.classList.add('tarjeta-en-cursor');
+  el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
 // Convierte un hallazgo pendiente en un registro de auditoría: a partir de
 // aquí comparte semáforo, fuente y estadísticas con "③ Revisar cifras". Al
 // registrar, además, el resaltado de la cifra en el documento cambia de
@@ -4495,9 +4692,10 @@ async function registrarHallazgo(id) {
   guardar(true); guardarHallazgos(true); actualizarStats(); renderLista(); renderHallazgos();
 
   const SEM_TXT = { verde:'Verificado', amarillo:'Corregir / en revisión', rojo:'Con problema' };
-  await actualizarColorEnWord(h.termino, h.semaforo);
+  await actualizarColorEnWord(h.termino, h.semaforo, contexto || h.contexto);
   insertarComentarioWordSiCorresponde(h.termino,
-    `Cifra "${h.termino}" registrada en Auditoría de Cifras PEN (marcado automático de números) — resultado: ${SEM_TXT[h.semaforo] || h.semaforo}. Revisó: ${revisor}. Fuente: ${fuenteFinal}. ${new Date().toLocaleDateString('es-CR')}.`);
+    `Cifra "${h.termino}" registrada en Auditoría de Cifras PEN (marcado automático de números) — resultado: ${SEM_TXT[h.semaforo] || h.semaforo}. Revisó: ${revisor}. Fuente: ${fuenteFinal}. ${new Date().toLocaleDateString('es-CR')}.`,
+    contexto || h.contexto);
 }
 
 // Quita un hallazgo de la lista de "① Marcar números" sin tocar el registro
@@ -4610,6 +4808,14 @@ function renderHallazgos() {
       </div>` : ''}
     </div>`;
   }).join('');
+
+  // Si el cursor de Word ya estaba ubicado sobre una cifra antes de este
+  // redibujado (por ejemplo, la persona abrió o cerró otra tarjeta), se
+  // conserva el resaltado sin esperar a que el cursor se mueva de nuevo.
+  if (hallazgoEnCursorId) {
+    const elCursor = document.getElementById('hz-tarjeta-' + hallazgoEnCursorId);
+    if (elCursor) elCursor.classList.add('tarjeta-en-cursor');
+  }
 }
 
 // ── RESUMEN DE ESTADÍSTICAS DEL DOCUMENTO ───────────────────────────────────
@@ -4829,6 +5035,7 @@ cuandoElDomEsteListo(() => {
     Office.onReady(() => {
       clearTimeout(respaldo);
       arrancarApp('Office');
+      registrarDetectorDeCursorEnWord();
     });
   } else {
     arrancarApp('navegador sin Office');
